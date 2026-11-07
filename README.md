@@ -15,11 +15,10 @@ Use Python 3.12. Run these commands from the `exercise_8` folder.
 
 ```bash
 python3.12 -m venv .venv
-source .venv/bin/activate
+# MacOS/Linux source .venv/bin/activate Windows venv\Scripts\activate` instead.
 python -m pip install -r requirements.txt
 ```
 
-On Windows, activate with `.venv\Scripts\activate` instead.
 
 ## Notebook
 
