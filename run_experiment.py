@@ -2,12 +2,11 @@
 
 import argparse
 import csv
-import importlib.metadata
-import platform
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.stats import mannwhitneyu
 
 from ipd import DEFAULT_SETTINGS, BITS, LABELS, NAMES, STRATEGIES, build_matrices, run_evolution
 
@@ -15,6 +14,8 @@ from ipd import DEFAULT_SETTINGS, BITS, LABELS, NAMES, STRATEGIES, build_matrice
 NOISE_LEVELS = (0.0, 0.01, 0.05)
 BASE_SEED = 21261112  # reproduces the saved 90-run study
 BOOTSTRAP_SAMPLES = 5000
+PILOT_RUNS = 10  # the first 10 runs of each condition serve as the pilot
+PAIRS = ((0.0, 0.01), (0.0, 0.05), (0.01, 0.05))  # (reference, treatment)
 RESULTS_FOLDER = Path(__file__).resolve().parent / "results"
 COLORS = {0.0: "#0072B2", 0.01: "#D55E00", 0.05: "#009E73"}
 
@@ -105,33 +106,114 @@ def bootstrap_difference(reference, treatment, rng, samples=BOOTSTRAP_SAMPLES):
     return float(effect), float(low), float(high)
 
 
-def make_comparisons(summaries, bootstrap_seed=BASE_SEED + 900000):
-    """Compare cooperation and payoff against the zero-noise condition."""
+def vargha_delaney_a12(reference, treatment):
+    """A12 = P(T > R) + 0.5 P(T = R) for a random treatment run T and reference run R.
+
+    0.5 means neither group tends to be larger (not that the distributions are equal).
+    Below 0.5, the treatment tends to be lower.
+    Usual thresholds for |A12 - 0.5|: 0.06 small, 0.14 medium, 0.21 large.
+    """
+
+    reference = np.array(reference)[:, None]
+    treatment = np.array(treatment)[None, :]
+
+    wins = (treatment > reference).sum() + 0.5 * (treatment == reference).sum()
+
+    return float(wins / (reference.size * treatment.size))
+
+
+def make_comparisons(summaries, bootstrap_seed=BASE_SEED + 900000, max_runs=None):
+    """Compare each pair of noise levels: bootstrap CI, Mann-Whitney test, and A12.
+
+    Runs are independent (different seeds), so we use the Mann-Whitney rank-sum test.
+    max_runs keeps only the first runs of each condition, for the pilot analysis.
+    """
 
     rng = np.random.default_rng(bootstrap_seed)
     comparisons = []
 
+    def group(noise, measure):
+        values = [row[measure] for row in summaries if row["noise"] == noise]
+        return values[:max_runs] if max_runs else values
+
     for measure in ("window_cooperation", "window_payoff"):
 
-        reference = [row[measure] for row in summaries if row["noise"] == 0]
+        for reference_noise, treatment_noise in PAIRS:
 
-        for noise in NOISE_LEVELS[1:]:
+            reference = group(reference_noise, measure)
+            treatment = group(treatment_noise, measure)
 
-            treatment = [row[measure] for row in summaries if row["noise"] == noise]
             effect, low, high = bootstrap_difference(reference, treatment, rng)
+            test = mannwhitneyu(treatment, reference, alternative="two-sided")
 
             comparisons.append({
                 "measure": measure,
-                "reference_noise": 0.0,
-                "treatment_noise": noise,
+                "reference_noise": reference_noise,
+                "treatment_noise": treatment_noise,
                 "runs_per_group": len(treatment),
                 "median_difference": effect,
                 "ci95_low": low,
                 "ci95_high": high,
                 "bootstrap_samples": BOOTSTRAP_SAMPLES,
+                "mann_whitney_U": float(test.statistic),
+                "mann_whitney_p": float(test.pvalue),
+                "vargha_delaney_A12": vargha_delaney_a12(reference, treatment),
             })
 
+    add_holm(comparisons)
+
     return comparisons
+
+
+def add_holm(comparisons):
+    """Add Holm-adjusted p-values, treating all tests in this list as one family."""
+
+    order = sorted(range(len(comparisons)), key=lambda i: comparisons[i]["mann_whitney_p"])
+    tests = len(comparisons)
+    running_max = 0.0
+
+    for rank, index in enumerate(order):
+
+        adjusted = min(1.0, (tests - rank) * comparisons[index]["mann_whitney_p"])
+        running_max = max(running_max, adjusted)  # adjusted p-values never decrease
+        comparisons[index]["holm_p"] = running_max
+
+
+def pilot_spread(summaries, pilot_runs=PILOT_RUNS):
+    """Describe the run-to-run spread in the first pilot_runs runs of each condition.
+
+    This is a retrospective pilot: the first 10 runs are part of the 30-run study,
+    so it is not independent evidence. It shows how large the spread is compared
+    with the gaps between conditions, which is what the run count must resolve.
+    """
+
+    rows = []
+
+    for noise in NOISE_LEVELS:
+
+        for measure in ("window_cooperation", "window_payoff"):
+
+            values = np.array([row[measure] for row in summaries if row["noise"] == noise])
+
+            for label, sample in (("pilot", values[:pilot_runs]), ("full", values)):
+
+                q1, median, q3 = np.quantile(sample, [0.25, 0.5, 0.75])
+
+                rows.append({
+                    "noise": noise,
+                    "measure": measure,
+                    "sample": label,
+                    "runs": len(sample),
+                    "median": float(median),
+                    "q1": float(q1),
+                    "q3": float(q3),
+                    "iqr": float(q3 - q1),
+                    "std": float(sample.std(ddof=1)),
+                    "min": float(sample.min()),
+                    "max": float(sample.max()),
+                })
+
+    return rows
 
 
 def read_matrix(path):
@@ -246,7 +328,7 @@ def plot_strategy_frequencies(histories, population_size=100):
     """Show which strategies become common in the populations."""
 
     fig, axes = plt.subplots(1, 3, figsize=(14, 4), sharey=True, layout="constrained")
-    tracked = [0, 5, 6, 7, 31]  # type 00111 keeps its bit-string label
+    tracked = [0, 5, 6, 7, 31]  # ALLC, TFT, PAVLOV, GRIM, ALLD
 
     for ax, noise in zip(axes, NOISE_LEVELS):
 
@@ -362,7 +444,8 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 
-def save_results(histories, summaries, matrices, comparisons, folder=RESULTS_FOLDER):
+def save_results(histories, summaries, matrices, comparisons, pilot, pilot_comparisons,
+                 folder=RESULTS_FOLDER):
     """Save files only when explicitly called by the command-line script."""
 
     folder = Path(folder)
@@ -377,6 +460,8 @@ def save_results(histories, summaries, matrices, comparisons, folder=RESULTS_FOL
 
     write_csv(folder / "run_summary.csv", summaries)
     write_csv(folder / "comparisons.csv", comparisons)
+    write_csv(folder / "pilot_spread.csv", pilot)
+    write_csv(folder / "pilot_comparisons.csv", pilot_comparisons)
 
     strategy_rows = []
 
@@ -444,36 +529,6 @@ def save_figures(histories, summaries, matrices, folder):
             plt.close(figure)
 
 
-def update_readme_settings(runs, base_seed, settings):
-    """Record the latest saved study's settings in the README."""
-
-    path = Path(__file__).resolve().parent / "README.md"
-    text = path.read_text(encoding="utf-8")
-    section_heading = "## Settings for the saved study"
-    next_paragraph = "Each individual's fitness"
-
-    # Replace the settings section while keeping the rest of the README.
-
-    before, rest = text.split(section_heading, 1)
-    _, after = rest.split(next_paragraph, 1)
-
-    lines = [f"Runs per noise level: **{runs}**. Total: **{runs * 3}**.", "",
-             "| Setting | Value |", "|---|---:|"]
-
-    for name, value in settings.items():
-        lines.append(f"| {name.replace('_', ' ')} | {value} |")
-
-    lines += ["", f"Base seed: `{base_seed}`. Each condition adds 10000; each run adds its index, starting at 0.",
-              f"Bootstrap seed: `{base_seed + 900000}`. Bootstrap samples: `{BOOTSTRAP_SAMPLES}`.",
-              "", f"Python: `{platform.python_version()}`."]
-
-    for package in ("numpy", "deap", "matplotlib"):
-        lines.append(f"{package}: `{importlib.metadata.version(package)}`.")
-
-    path.write_text(before + section_heading + "\n\n" + "\n".join(lines) + "\n\n" + next_paragraph + after,
-                    encoding="utf-8")
-
-
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -489,8 +544,9 @@ if __name__ == "__main__":
 
     histories, summaries, matrices = run_study(arguments.runs, arguments.seed, settings)
     comparisons = make_comparisons(summaries, arguments.seed + 900000)
+    pilot = pilot_spread(summaries)
+    pilot_comparisons = make_comparisons(summaries, arguments.seed + 900000, max_runs=PILOT_RUNS)
 
-    save_results(histories, summaries, matrices, comparisons)
-    update_readme_settings(arguments.runs, arguments.seed, settings)
+    save_results(histories, summaries, matrices, comparisons, pilot, pilot_comparisons)
 
     print(f"Saved results to {RESULTS_FOLDER}")

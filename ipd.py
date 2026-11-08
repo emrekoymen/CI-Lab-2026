@@ -31,7 +31,12 @@ for strategy in STRATEGIES:
     bits = "".join(str(bit) for bit in strategy)
     BITS.append(bits)
 
-NAMES = {0: "ALLC", 5: "TFT", 6: "PAVLOV", 31: "ALLD"}
+# GRIM here is the memory-1 version: it only sees the last round. Without noise it
+# never forgives. With noise, it returns to cooperation only if both players
+# accidentally cooperate in the same round (chance about noise**2), unlike a true
+# grim trigger that remembers every past defection.
+
+NAMES = {0: "ALLC", 5: "TFT", 6: "PAVLOV", 7: "GRIM", 31: "ALLD"}
 LABELS = []
 
 for strategy_id, bits in enumerate(BITS):
