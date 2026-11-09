@@ -7,9 +7,7 @@ import numpy as np
 from deap import algorithms, base, creator, tools
 
 
-# Fixed settings. We change only the action noise in the experiment.
-
-DEFAULT_SETTINGS = {
+SETTINGS = {
     "population": 100,
     "generations": 500,
     "rounds": 150,
@@ -21,272 +19,158 @@ DEFAULT_SETTINGS = {
     "final_window": 100,
 }
 
-# All five-bit strategies, in binary order: 00000 to 11111.
-# Bits: first action, after CC, after CD, after DC, after DD.
+#0 = cooperate, 1 = defect
+STRATEGIES = np.array(list(product([0, 1], repeat=5)))
 
-STRATEGIES = np.array(list(product((0, 1), repeat=5)), dtype=int)
 BITS = []
-
 for strategy in STRATEGIES:
-    bits = "".join(str(bit) for bit in strategy)
-    BITS.append(bits)
-
-# GRIM here is the memory-1 version: it only sees the last round. Without noise it
-# never forgives. With noise, it returns to cooperation only if both players
-# accidentally cooperate in the same round (chance about noise**2), unlike a true
-# grim trigger that remembers every past defection.
+    BITS.append("".join(str(bit) for bit in strategy))
 
 NAMES = {0: "ALLC", 5: "TFT", 6: "PAVLOV", 7: "GRIM", 31: "ALLD"}
+
 LABELS = []
-
-for strategy_id, bits in enumerate(BITS):
-
-    label = f"{strategy_id:02d}: {bits}"
-
+for strategy_id in range(32):
+    label = f"{strategy_id:02d}: {BITS[strategy_id]}"
     if strategy_id in NAMES:
         label += f' ("{NAMES[strategy_id]}")'
-
     LABELS.append(label)
 
-# 0 = cooperate, 1 = defect. Own action comes first.
-
-OUTCOMES = [(0, 0), (0, 1), (1, 0), (1, 1)]  # CC, CD, DC, DD
-REWARDS = np.array([3.0, 0.0, 5.0, 1.0])  # points for player A
-COOPERATION = np.array([1.0, 0.5, 0.5, 0.0])  # fraction of both actions that are C
+PAYOFF = {(0, 0): 3, (0, 1): 0, (1, 0): 5, (1, 1): 1}
+OUTCOMES = list(PAYOFF)
 
 
 def strategy_to_id(strategy):
-    """Convert five bits into an ID. Example: 00101 becomes 5."""
-
-    if len(strategy) != 5 or any(bit not in (0, 1) for bit in strategy):
-        raise ValueError("A strategy needs five bits, each 0 or 1.")
-
     strategy_id = 0
-
     for bit in strategy:
-        strategy_id = strategy_id * 2 + int(bit)
-
+        strategy_id = 2 * strategy_id + int(bit)
     return strategy_id
 
 
 def outcome_probabilities(intended_a, intended_b, noise):
-    """Calculate the chances of CC, CD, DC and DD after action errors."""
-
-    if not 0 <= noise <= 1:
-        raise ValueError("Noise must be between 0 and 1.")
-
     probabilities = []
-
     for actual_a, actual_b in OUTCOMES:
-
-        # Matching the intention has chance 1-noise. Flipping it has chance noise.
-
         chance_a = 1 - noise if actual_a == intended_a else noise
         chance_b = 1 - noise if actual_b == intended_b else noise
-
-        probabilities.append(chance_a * chance_b)  # independent errors
-
+        probabilities.append(chance_a * chance_b)
     return np.array(probabilities, dtype=float)
 
 
 def expected_match(strategy_a, strategy_b, noise, rounds=150):
-    """Calculate expected payoff and cooperation over one whole match."""
-
-    if rounds < 1:
-        raise ValueError("A match needs at least one round.")
-
-    # First round: use the first bit of each strategy.
-
+    """Expected payoff (for player A) and cooperation per round."""
     probabilities = outcome_probabilities(strategy_a[0], strategy_b[0], noise)
 
-    # Each row tells us the next outcome probabilities after CC, CD, DC or DD.
-
+    #next_round[i] = chances of each outcome after outcome i
     next_round = np.zeros((4, 4))
-
-    for outcome_id, (action_a, action_b) in enumerate(OUTCOMES):
-
-        # 1 + 2*own + opponent selects the correct response bit.
-        # Player B reads the same outcome from its own point of view.
-
+    for i in range(4):
+        action_a, action_b = OUTCOMES[i]
         intended_a = strategy_a[1 + 2 * action_a + action_b]
         intended_b = strategy_b[1 + 2 * action_b + action_a]
-
-        next_round[outcome_id] = outcome_probabilities(intended_a, intended_b, noise)
-
-    # Count expected outcomes over all rounds, including round one.
+        next_round[i] = outcome_probabilities(intended_a, intended_b, noise)
 
     totals = probabilities.copy()
-
-    for _ in range(1, rounds):
-
-        probabilities = probabilities @ next_round  # combine the possible next outcomes
+    for round_number in range(1, rounds):
+        probabilities = probabilities @ next_round
         totals += probabilities
 
-    payoff = float(totals @ REWARDS / rounds)  # expected points per round
-    cooperation = float(totals @ COOPERATION / rounds)  # expected fraction of cooperative actions
-
-    return payoff, cooperation
+    #outcomes in the order CC, CD, DC, DD
+    payoff = totals @ np.array([3, 0, 5, 1]) / rounds
+    cooperation = totals @ np.array([1, 0.5, 0.5, 0]) / rounds
+    return float(payoff), float(cooperation)
 
 
 def build_matrices(noise, rounds=150):
-    """Calculate A and H for all 32 x 32 pairs at one noise level."""
-
     A = np.zeros((32, 32))
     H = np.zeros((32, 32))
-
-    for row_id, strategy_a in enumerate(STRATEGIES):
-
-        for column_id, strategy_b in enumerate(STRATEGIES):
-
-            payoff, cooperation = expected_match(strategy_a, strategy_b, noise, rounds)
-
-            A[row_id, column_id] = payoff
-            H[row_id, column_id] = cooperation
-
+    for i in range(32):
+        for j in range(32):
+            A[i, j], H[i, j] = expected_match(STRATEGIES[i], STRATEGIES[j], noise, rounds)
     return A, H
 
 
 def simulate_match(strategy_a, strategy_b, noise, rounds=150, seed=1, matches=1):
-    """Actually play random matches. Useful for checking the expected values."""
+    #play real random matches, to check expected_match
+    rng = np.random.default_rng(seed)
 
-    rng = np.random.default_rng(seed)  # reproducible action errors
-
-    intended_a = np.full(matches, strategy_a[0], dtype=int)
-    intended_b = np.full(matches, strategy_b[0], dtype=int)
-
+    intended_a = np.full(matches, strategy_a[0])
+    intended_b = np.full(matches, strategy_b[0])
     payoffs = np.zeros(matches)
     cooperation = np.zeros(matches)
 
-    for _ in range(rounds):
-
-        # Draw an error separately for each player's action.
-
+    for round_number in range(rounds):
         error_a = rng.random(matches) < noise
         error_b = rng.random(matches) < noise
 
-        actual_a = np.where(error_a, 1 - intended_a, intended_a)
-        actual_b = np.where(error_b, 1 - intended_b, intended_b)
+        for match in range(matches):
+            actual_a = intended_a[match]
+            actual_b = intended_b[match]
+            if error_a[match]:
+                actual_a = 1 - actual_a
+            if error_b[match]:
+                actual_b = 1 - actual_b
 
-        payoffs += REWARDS[2 * actual_a + actual_b]
-        cooperation += (2 - actual_a - actual_b) / 2
+            payoffs[match] += PAYOFF[(actual_a, actual_b)]
+            cooperation[match] += (2 - actual_a - actual_b) / 2
 
-        # Next intentions use the actual actions from this round.
-
-        intended_a = strategy_a[1 + 2 * actual_a + actual_b]
-        intended_b = strategy_b[1 + 2 * actual_b + actual_a]
+            intended_a[match] = strategy_a[1 + 2 * actual_a + actual_b]
+            intended_b[match] = strategy_b[1 + 2 * actual_b + actual_a]
 
     return payoffs / rounds, cooperation / rounds
 
 
-def make_toolbox(settings):
-    """Prepare the DEAP functions we will use."""
-
-    # Create these classes once, so rerunning notebook cells is safe.
-
+def make_toolbox():
     if not hasattr(creator, "IPDFitnessMax"):
-
-        creator.create("IPDFitnessMax", base.Fitness, weights=(1.0,))  # maximize payoff
+        creator.create("IPDFitnessMax", base.Fitness, weights=(1.0,))
         creator.create("IPDIndividual", list, fitness=creator.IPDFitnessMax)
 
     toolbox = base.Toolbox()
-
     toolbox.register("bit", random.randint, 0, 1)
     toolbox.register("individual", tools.initRepeat, creator.IPDIndividual, toolbox.bit, n=5)
     toolbox.register("population", tools.initRepeat, list, toolbox.individual)
-
-    toolbox.register("select", tools.selTournament, tournsize=settings["tournament_size"])
-    toolbox.register("mate", tools.cxUniform, indpb=settings["crossover_bit_probability"])
-    toolbox.register("mutate", tools.mutFlipBit, indpb=settings["mutation_bit_probability"])
-
+    toolbox.register("select", tools.selTournament, tournsize=SETTINGS["tournament_size"])
+    toolbox.register("mate", tools.cxUniform, indpb=SETTINGS["crossover_bit_probability"])
+    toolbox.register("mutate", tools.mutFlipBit, indpb=SETTINGS["mutation_bit_probability"])
     return toolbox
 
 
 def evaluate_population(population, A, H):
-    """Calculate everyone's fitness against the current opponents."""
-
-    strategy_ids = []
-
-    for individual in population:
-        strategy_ids.append(strategy_to_id(individual))
-
-    counts = np.bincount(strategy_ids, minlength=32)  # number of each type
+    """Fitness = average payoff against the other individuals (no self-play)."""
+    ids = [strategy_to_id(individual) for individual in population]
+    counts = np.bincount(ids, minlength=32)
     population_size = len(population)
 
-    if population_size < 2:
-        raise ValueError("At least two individuals are needed to play each other.")
-
-    # Add the payoff against every opponent, remove self-play, then take the average.
-
     fitness_by_type = (A @ counts - A.diagonal()) / (population_size - 1)
+    cooperation_by_type = (H @ counts - H.diagonal()) / (population_size - 1)
 
-    for individual, strategy_id in zip(population, strategy_ids):
+    for individual, strategy_id in zip(population, ids):
         individual.fitness.values = (float(fitness_by_type[strategy_id]),)
 
     mean_payoff = float(counts @ fitness_by_type / population_size)
-
-    # Apply the same opponent counting to cooperation.
-
-    cooperation_by_type = (H @ counts - H.diagonal()) / (population_size - 1)
     mean_cooperation = float(counts @ cooperation_by_type / population_size)
-
     return counts, mean_payoff, mean_cooperation
 
 
-def run_evolution(A, H, seed, settings=None):
-    """Evolve one population and return its results in memory."""
-
-    if settings is None:
-        settings = DEFAULT_SETTINGS.copy()
-
-    if not 0 <= settings["elites"] < settings["population"]:
-        raise ValueError("Elites must be fewer than the population size.")
-
-    if not 1 <= settings["final_window"] <= settings["generations"]:
-        raise ValueError("The final window must fit inside the evolution.")
-
-    random.seed(seed)  # reproducible DEAP choices
-
-    toolbox = make_toolbox(settings)
-    population = toolbox.population(n=settings["population"])
+def run_evolution(A, H, seed):
+    random.seed(seed)
+    toolbox = make_toolbox()
+    population = toolbox.population(n=SETTINGS["population"])
     history = []
 
-    for generation in range(settings["generations"] + 1):
-
-        # The opponents change, so everyone needs a fresh fitness value.
-
+    for generation in range(SETTINGS["generations"] + 1):
         counts, payoff, cooperation = evaluate_population(population, A, H)
 
-        row = {
-            "generation": generation,
-            "payoff": payoff,
-            "cooperation": cooperation,
-        }
-
+        row = {"generation": generation, "payoff": payoff, "cooperation": cooperation}
         for bits, count in zip(BITS, counts):
             row[f"count_{bits}"] = int(count)
-
         history.append(row)
 
-        if generation == settings["generations"]:
+        if generation == SETTINGS["generations"]:
             break
 
-        # Copy the two best individuals into the next population.
-
-        best = tools.selBest(population, settings["elites"])
+        best = tools.selBest(population, SETTINGS["elites"])
         elites = [toolbox.clone(individual) for individual in best]
-
-        # Choose the remaining parents, then cross and mutate their copies.
-
-        number_of_children = settings["population"] - settings["elites"]
-        parents = toolbox.select(population, number_of_children)
-
-        children = algorithms.varAnd(
-            parents,
-            toolbox,
-            cxpb=settings["crossover_probability"],
-            mutpb=1.0,  # apply the 0.01-per-bit mutation procedure to every child
-        )
-
+        parents = toolbox.select(population, SETTINGS["population"] - SETTINGS["elites"])
+        #mutpb=1: every child goes through mutFlipBit, which flips each bit with 1% chance
+        children = algorithms.varAnd(parents, toolbox, cxpb=SETTINGS["crossover_probability"], mutpb=1.0)
         population = children + elites
 
     return history

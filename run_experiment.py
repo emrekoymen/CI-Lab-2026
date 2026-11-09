@@ -1,4 +1,4 @@
-"""Run repeated experiments and save their results. Use: python run_experiment.py"""
+"""Run the repeated study and save results. Use: python run_experiment.py --runs 30"""
 
 import argparse
 import csv
@@ -8,140 +8,119 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.stats import mannwhitneyu
 
-from ipd import DEFAULT_SETTINGS, BITS, LABELS, NAMES, STRATEGIES, build_matrices, run_evolution
+from ipd import SETTINGS, BITS, LABELS, NAMES, STRATEGIES, build_matrices, run_evolution
 
 
-NOISE_LEVELS = (0.0, 0.01, 0.05)
-BASE_SEED = 21261112  # reproduces the saved 90-run study
+NOISE_LEVELS = [0.0, 0.01, 0.05]
+PAIRS = [(0.0, 0.01), (0.0, 0.05), (0.01, 0.05)]
+MEASURES = ["window_cooperation", "window_payoff"]
+BASE_SEED = 21261112
+BOOTSTRAP_SEED = BASE_SEED + 900000
 BOOTSTRAP_SAMPLES = 5000
-PILOT_RUNS = 10  # the first 10 runs of each condition serve as the pilot
-PAIRS = ((0.0, 0.01), (0.0, 0.05), (0.01, 0.05))  # (reference, treatment)
+PILOT_RUNS = 10
 RESULTS_FOLDER = Path(__file__).resolve().parent / "results"
-COLORS = {0.0: "#0072B2", 0.01: "#D55E00", 0.05: "#009E73"}
+COLORS = {0.0: "tab:blue", 0.01: "tab:orange", 0.05: "tab:green"}
 
 
-def summarize_run(history, noise, run, seed, settings):
-    """Reduce one run to its final counts and last-100-generation averages."""
-
+def summarize_run(history, noise, run, seed):
     final = history[-1]
-    window = history[-settings["final_window"]:]
+    window = history[-SETTINGS["final_window"]:]
 
-    summary = {
-        "noise": noise,
-        "run": run,
-        "seed": seed,
-        **settings,
-        "final_payoff": final["payoff"],
-        "final_cooperation": final["cooperation"],
-        "window_payoff": float(np.mean([row["payoff"] for row in window])),
-        "window_cooperation": float(np.mean([row["cooperation"] for row in window])),
-    }
+    summary = {"noise": noise, "run": run, "seed": seed}
+    summary.update(SETTINGS)
+    summary["final_payoff"] = final["payoff"]
+    summary["final_cooperation"] = final["cooperation"]
+    summary["window_payoff"] = float(np.mean([row["payoff"] for row in window]))
+    summary["window_cooperation"] = float(np.mean([row["cooperation"] for row in window]))
 
     for bits in BITS:
-
         summary[f"final_count_{bits}"] = final[f"count_{bits}"]
-        counts = [row[f"count_{bits}"] for row in window]
-        summary[f"window_mean_count_{bits}"] = float(np.mean(counts))
+        summary[f"window_mean_count_{bits}"] = float(np.mean([row[f"count_{bits}"] for row in window]))
 
     return summary
 
 
-def run_study(runs=30, base_seed=BASE_SEED, settings=None, matrices=None):
-    """Run the populations and return results in memory. This function saves no files."""
-
-    if settings is None:
-        settings = DEFAULT_SETTINGS.copy()
-
-    if not 1 <= runs <= 10000:
-        raise ValueError("Choose between 1 and 10000 runs per noise level.")
-
+def run_study(runs=30, matrices=None):
     if matrices is None:
         matrices = {}
-
     histories = {}
     summaries = []
 
     for condition, noise in enumerate(NOISE_LEVELS):
-
         if noise not in matrices:
-            matrices[noise] = build_matrices(noise, settings["rounds"])
-
+            matrices[noise] = build_matrices(noise, SETTINGS["rounds"])
         A, H = matrices[noise]
         histories[noise] = []
 
         for run in range(runs):
-
-            seed = base_seed + condition * 10000 + run  # a different seed for every run
-            history = run_evolution(A, H, seed, settings)
-
+            seed = BASE_SEED + condition * 10000 + run
+            history = run_evolution(A, H, seed)
             histories[noise].append(history)
-            summaries.append(summarize_run(history, noise, run + 1, seed, settings))
+            summaries.append(summarize_run(history, noise, run + 1, seed))
 
-        print(f"Noise {noise:g}: finished {runs} run(s) of {settings['population']} individuals.", flush=True)
+        print(f"Noise {noise:g}: finished {runs} run(s).")
 
     return histories, summaries, matrices
 
 
-def bootstrap_difference(reference, treatment, rng, samples=BOOTSTRAP_SAMPLES):
-    """Estimate how uncertain the difference between two medians is."""
+def get_values(summaries, noise, column):
+    values = []
+    for row in summaries:
+        if row["noise"] == noise:
+            values.append(row[column])
+    return values
 
+
+def bootstrap_difference(reference, treatment, rng):
+    """Median difference (treatment - reference) with a 95% bootstrap interval"""
     reference = np.array(reference)
     treatment = np.array(treatment)
 
-    if len(reference) < 2 or len(treatment) < 2:
-        raise ValueError("Confidence intervals need repeated runs in each group.")
-
-    # Make new groups by randomly picking existing runs, allowing repeats.
-
-    reference_groups = rng.choice(reference, size=(samples, len(reference)), replace=True)
-    treatment_groups = rng.choice(treatment, size=(samples, len(treatment)), replace=True)
-
-    differences = np.median(treatment_groups, axis=1) - np.median(reference_groups, axis=1)
-
-    # The middle 95% of these differences gives the confidence interval.
+    reference_samples = rng.choice(reference, size=(BOOTSTRAP_SAMPLES, len(reference)))
+    treatment_samples = rng.choice(treatment, size=(BOOTSTRAP_SAMPLES, len(treatment)))
+    reference_medians = np.median(reference_samples, axis=1)
+    treatment_medians = np.median(treatment_samples, axis=1)
+    differences = treatment_medians - reference_medians
 
     low, high = np.quantile(differences, [0.025, 0.975])
     effect = np.median(treatment) - np.median(reference)
-
     return float(effect), float(low), float(high)
 
 
 def vargha_delaney_a12(reference, treatment):
-    """A12 = P(T > R) + 0.5 P(T = R) for a random treatment run T and reference run R.
-
-    0.5 means neither group tends to be larger (not that the distributions are equal).
-    Below 0.5, the treatment tends to be lower.
-    Usual thresholds for |A12 - 0.5|: 0.06 small, 0.14 medium, 0.21 large.
-    """
-
-    reference = np.array(reference)[:, None]
-    treatment = np.array(treatment)[None, :]
-
-    wins = (treatment > reference).sum() + 0.5 * (treatment == reference).sum()
-
-    return float(wins / (reference.size * treatment.size))
+    """Chance that a treatment run beats a reference run"""
+    wins = 0.0
+    for treatment_value in treatment:
+        for reference_value in reference:
+            if treatment_value > reference_value:
+                wins += 1
+            elif treatment_value == reference_value:
+                wins += 0.5
+    return wins / (len(reference) * len(treatment))
 
 
-def make_comparisons(summaries, bootstrap_seed=BASE_SEED + 900000, max_runs=None):
-    """Compare each pair of noise levels: bootstrap CI, Mann-Whitney test, and A12.
+def add_holm(comparisons):
+    comparisons_by_p = sorted(comparisons, key=lambda row: row["mann_whitney_p"])
+    number_of_tests = len(comparisons)
+    largest = 0.0
+    for rank, row in enumerate(comparisons_by_p):
+        adjusted = min(1.0, (number_of_tests - rank) * row["mann_whitney_p"])
+        largest = max(largest, adjusted)
+        row["holm_p"] = largest
 
-    Runs are independent (different seeds), so we use the Mann-Whitney rank-sum test.
-    max_runs keeps only the first runs of each condition, for the pilot analysis.
-    """
 
-    rng = np.random.default_rng(bootstrap_seed)
+def make_comparisons(summaries, max_runs=None):
+    """Compare each pair of noise levels. max_runs keeps only the first runs"""
+    rng = np.random.default_rng(BOOTSTRAP_SEED)
     comparisons = []
 
-    def group(noise, measure):
-        values = [row[measure] for row in summaries if row["noise"] == noise]
-        return values[:max_runs] if max_runs else values
-
-    for measure in ("window_cooperation", "window_payoff"):
-
+    for measure in MEASURES:
         for reference_noise, treatment_noise in PAIRS:
-
-            reference = group(reference_noise, measure)
-            treatment = group(treatment_noise, measure)
+            reference = get_values(summaries, reference_noise, measure)
+            treatment = get_values(summaries, treatment_noise, measure)
+            if max_runs is not None:
+                reference = reference[:max_runs]
+                treatment = treatment[:max_runs]
 
             effect, low, high = bootstrap_difference(reference, treatment, rng)
             test = mannwhitneyu(treatment, reference, alternative="two-sided")
@@ -161,44 +140,17 @@ def make_comparisons(summaries, bootstrap_seed=BASE_SEED + 900000, max_runs=None
             })
 
     add_holm(comparisons)
-
     return comparisons
 
 
-def add_holm(comparisons):
-    """Add Holm-adjusted p-values, treating all tests in this list as one family."""
-
-    order = sorted(range(len(comparisons)), key=lambda i: comparisons[i]["mann_whitney_p"])
-    tests = len(comparisons)
-    running_max = 0.0
-
-    for rank, index in enumerate(order):
-
-        adjusted = min(1.0, (tests - rank) * comparisons[index]["mann_whitney_p"])
-        running_max = max(running_max, adjusted)  # adjusted p-values never decrease
-        comparisons[index]["holm_p"] = running_max
-
-
-def pilot_spread(summaries, pilot_runs=PILOT_RUNS):
-    """Describe the run-to-run spread in the first pilot_runs runs of each condition.
-
-    This is a retrospective pilot: the first 10 runs are part of the 30-run study,
-    so it is not independent evidence. It shows how large the spread is compared
-    with the gaps between conditions, which is what the run count must resolve.
-    """
-
+def pilot_spread(summaries):
     rows = []
-
     for noise in NOISE_LEVELS:
+        for measure in MEASURES:
+            values = np.array(get_values(summaries, noise, measure))
 
-        for measure in ("window_cooperation", "window_payoff"):
-
-            values = np.array([row[measure] for row in summaries if row["noise"] == noise])
-
-            for label, sample in (("pilot", values[:pilot_runs]), ("full", values)):
-
+            for label, sample in [("pilot", values[:PILOT_RUNS]), ("full", values)]:
                 q1, median, q3 = np.quantile(sample, [0.25, 0.5, 0.75])
-
                 rows.append({
                     "noise": noise,
                     "measure": measure,
@@ -212,248 +164,65 @@ def pilot_spread(summaries, pilot_runs=PILOT_RUNS):
                     "min": float(sample.min()),
                     "max": float(sample.max()),
                 })
-
     return rows
-
-
-def read_matrix(path):
-    """Read labels and numbers from one matrix CSV."""
-
-    with Path(path).open(newline="", encoding="utf-8") as file:
-        rows = list(csv.reader(file))  # each CSV row becomes a list of text values
-
-    labels = rows[0][1:]  # first row, except the corner cell
-    values = []
-
-    for row in rows[1:]:  # skip the header
-
-        numbers = []
-
-        for value in row[1:]:  # skip the row label
-            numbers.append(float(value))  # convert text to a number
-
-        values.append(numbers)
-
-    return labels, np.array(values)
-
-
-def read_numeric_rows(path):
-    """Read a results CSV, using its column names as dictionary keys."""
-
-    with Path(path).open(newline="", encoding="utf-8") as file:
-        rows = list(csv.DictReader(file))
-
-    for row in rows:
-
-        for column in row:
-            row[column] = float(row[column])  # CSV values start as text
-
-    return rows
-
-
-def load_results(folder=RESULTS_FOLDER):
-    """Read saved runs without running evolution again."""
-
-    folder = Path(folder)
-    summaries = read_numeric_rows(folder / "run_summary.csv")
-    histories = {noise: [] for noise in NOISE_LEVELS}
-    matrices = {}
-
-    # Use the summary to identify the saved runs.
-
-    for summary in summaries:
-
-        noise = summary["noise"]
-        run = int(summary["run"])
-        path = folder / "histories" / f"noise_{noise:g}_run_{run:03d}.csv"
-
-        histories[noise].append(read_numeric_rows(path))
-
-    for noise in NOISE_LEVELS:
-
-        _, A = read_matrix(folder / f"A_noise_{noise:g}.csv")
-        _, H = read_matrix(folder / f"H_noise_{noise:g}.csv")
-
-        matrices[noise] = (A, H)
-
-    return histories, summaries, matrices
-
-
-def plot_outcomes(histories, population_size=100):
-    """Show cooperation and payoff over generations. Return a figure without saving."""
-
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4), layout="constrained")
-    number_of_runs = len(histories[0.0])
-
-    for noise in NOISE_LEVELS:
-
-        for ax, measure in zip(axes, ("cooperation", "payoff")):
-
-            values = []
-
-            for history in histories[noise]:
-                values.append([row[measure] for row in history])
-
-            values = np.array(values)
-
-            if measure == "cooperation":
-                values = values * 100  # show cooperation as a percentage
-
-            generations = np.arange(values.shape[1])
-            middle = np.median(values, axis=0)
-
-            ax.plot(generations, middle, color=COLORS[noise], label=f"noise {noise:g}")
-
-            if number_of_runs > 1:
-                ax.fill_between(generations, values.min(axis=0), values.max(axis=0),
-                                color=COLORS[noise], alpha=0.15)
-
-            ax.set_xlabel("Generation")
-
-    axes[0].set(ylabel="Cooperative actions (%)", ylim=(0, 100))
-    axes[1].set(ylabel="Payoff per round", ylim=(0, 5))
-    axes[0].legend()
-
-    if number_of_runs == 1:
-        title = f"Live experiment | 1 run per noise level | {population_size} individuals per run"
-    else:
-        title = f"{number_of_runs} runs per noise level | {population_size} individuals per run | median and full range"
-
-    fig.suptitle(title)
-
-    return fig
-
-
-def plot_strategy_frequencies(histories, population_size=100):
-    """Show which strategies become common in the populations."""
-
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4), sharey=True, layout="constrained")
-    tracked = [0, 5, 6, 7, 31]  # ALLC, TFT, PAVLOV, GRIM, ALLD
-
-    for ax, noise in zip(axes, NOISE_LEVELS):
-
-        runs = []
-
-        for history in histories[noise]:
-            runs.append([[row[f"count_{bits}"] for bits in BITS] for row in history])
-
-        percentages = np.mean(runs, axis=0) * 100 / population_size
-        generations = np.arange(len(percentages))
-
-        for strategy_id in tracked:
-            ax.plot(generations, percentages[:, strategy_id], label=LABELS[strategy_id])
-
-        other_ids = [i for i in range(32) if i not in tracked]
-        other = percentages[:, other_ids].sum(axis=1)
-
-        ax.plot(generations, other, color="gray", ls="--", label="Other strategies")
-        ax.set(title=f"Noise {noise:g}", xlabel="Generation", ylim=(0, 100))
-
-    axes[0].set_ylabel("Population (%)")
-    axes[-1].legend(fontsize=7, loc="upper left", bbox_to_anchor=(1.02, 1))
-
-    return fig
-
-
-def plot_matrix(matrix, noise, kind):
-    """Show all 32 strategies in A or H."""
-
-    maximum = 5 if kind == "A" else 1
-    title = "Expected payoff A" if kind == "A" else "Cooperation H"
-
-    fig, ax = plt.subplots(figsize=(13, 12), layout="constrained")
-    image = ax.imshow(matrix, vmin=0, vmax=maximum, cmap="viridis")
-
-    ax.set_xticks(range(32), LABELS, rotation=90, fontsize=7)
-    ax.set_yticks(range(32), LABELS, fontsize=7)
-    ax.set(title=f"{title} | noise {noise:g}", xlabel="Column opponent", ylabel="Row strategy")
-
-    fig.colorbar(image, ax=ax, shrink=0.75)
-
-    return fig
-
-
-def plot_classical_payoffs(matrices):
-    """Show a smaller selection of A, with the payoffs printed in the cells."""
-
-    selected = [0, 31, 5, 6, 7]
-    names = [NAMES.get(i, BITS[i]) for i in selected]
-
-    fig, axes = plt.subplots(1, 3, figsize=(14, 5), layout="constrained")
-
-    for ax, noise in zip(axes, NOISE_LEVELS):
-
-        A, _ = matrices[noise]
-        values = A[np.ix_(selected, selected)]  # choose these rows and columns
-
-        ax.imshow(values, vmin=0, vmax=5, cmap="Blues")
-        ax.set_xticks(range(5), names, rotation=45, ha="right")
-        ax.set_yticks(range(5), names)
-        ax.set(title=f"Payoff A | noise {noise:g}", xlabel="Column opponent")
-
-        for row in range(5):
-
-            for column in range(5):
-
-                value = values[row, column]
-                text_color = "white" if value > 2.5 else "black"
-
-                ax.text(column, row, f"{value:.2f}", ha="center", va="center", color=text_color)
-
-    return fig
-
-
-def plot_final_window(summaries):
-    """Show each repeated run's average over its final 100 generations."""
-
-    fig, axes = plt.subplots(1, 2, figsize=(9, 4), layout="constrained")
-
-    for ax, measure in zip(axes, ("window_cooperation", "window_payoff")):
-
-        for position, noise in enumerate(NOISE_LEVELS):
-
-            values = np.array([row[measure] for row in summaries if row["noise"] == noise])
-
-            if measure == "window_cooperation":
-                values = values * 100
-
-            positions = position + np.linspace(-0.12, 0.12, len(values))
-
-            ax.scatter(positions, values, color=COLORS[noise], alpha=0.65, s=20)
-            ax.plot([position - 0.2, position + 0.2], [np.median(values)] * 2, color="black")
-
-        ax.set_xticks(range(3), [str(noise) for noise in NOISE_LEVELS])
-        ax.set_xlabel("Action noise")
-
-    axes[0].set(ylabel="Cooperative actions (%)", ylim=(0, 100))
-    axes[1].set_ylabel("Payoff per round")
-    window = int(summaries[0]["final_window"])
-    population_size = int(summaries[0]["population"])
-    fig.suptitle(f"Final {window} generations | each dot is one run of {population_size} individuals")
-
-    return fig
 
 
 def write_csv(path, rows):
-    """Save a list of dictionaries as a CSV table."""
-
-    with path.open("w", newline="", encoding="utf-8") as file:
-
+    with open(path, "w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
 
 
-def save_results(histories, summaries, matrices, comparisons, pilot, pilot_comparisons,
-                 folder=RESULTS_FOLDER):
-    """Save files only when explicitly called by the command-line script."""
+def read_csv(path):
+    with open(path, newline="", encoding="utf-8") as file:
+        rows = list(csv.DictReader(file))
+    for row in rows:
+        for key in row:
+            row[key] = float(row[key])
+    return rows
 
+
+def write_matrix(path, matrix):
+    with open(path, "w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow(["row_strategy / column_opponent"] + LABELS)
+        for label, values in zip(LABELS, matrix):
+            writer.writerow([label] + list(values))
+
+
+def read_matrix(path):
+    with open(path, newline="", encoding="utf-8") as file:
+        rows = list(csv.reader(file))
+    labels = rows[0][1:]
+    values = []
+    for row in rows[1:]:
+        values.append([float(value) for value in row[1:]])
+    return labels, np.array(values)
+
+
+def load_results(folder=RESULTS_FOLDER):
     folder = Path(folder)
-    folder.mkdir(parents=True, exist_ok=True)
-    (folder / "histories").mkdir(exist_ok=True)
-    (folder / "figures").mkdir(exist_ok=True)
+    summaries = read_csv(folder / "run_summary.csv")
 
-    # Remove old generated histories before replacing the study.
+    histories = {noise: [] for noise in NOISE_LEVELS}
+    for row in summaries:
+        path = folder / "histories" / f"noise_{row['noise']:g}_run_{int(row['run']):03d}.csv"
+        histories[row["noise"]].append(read_csv(path))
+
+    matrices = {}
+    for noise in NOISE_LEVELS:
+        labels, A = read_matrix(folder / f"A_noise_{noise:g}.csv")
+        labels, H = read_matrix(folder / f"H_noise_{noise:g}.csv")
+        matrices[noise] = (A, H)
+
+    return histories, summaries, matrices
+
+
+def save_results(histories, summaries, matrices, comparisons, pilot, pilot_comparisons):
+    folder = RESULTS_FOLDER
+    (folder / "histories").mkdir(parents=True, exist_ok=True)
+    (folder / "figures").mkdir(exist_ok=True)
 
     for old_file in (folder / "histories").glob("noise_*_run_*.csv"):
         old_file.unlink()
@@ -464,89 +233,183 @@ def save_results(histories, summaries, matrices, comparisons, pilot, pilot_compa
     write_csv(folder / "pilot_comparisons.csv", pilot_comparisons)
 
     strategy_rows = []
-
-    for strategy_id, genes in enumerate(STRATEGIES):
-
-        row = {
-            "id": strategy_id,
-            "bits": BITS[strategy_id],
-            "name": NAMES.get(strategy_id, ""),
-            "label": LABELS[strategy_id],
-        }
-
-        for name, bit in zip(("first", "after_CC", "after_CD", "after_DC", "after_DD"), genes):
-            row[name] = int(bit)
-
-        strategy_rows.append(row)
-
+    for i, genes in enumerate(STRATEGIES):
+        strategy_rows.append({
+            "id": i,
+            "bits": BITS[i],
+            "name": NAMES.get(i, ""),
+            "label": LABELS[i],
+            "first": int(genes[0]),
+            "after_CC": int(genes[1]),
+            "after_CD": int(genes[2]),
+            "after_DC": int(genes[3]),
+            "after_DD": int(genes[4]),
+        })
     write_csv(folder / "strategies.csv", strategy_rows)
 
     for noise in NOISE_LEVELS:
-
         for run, history in enumerate(histories[noise], start=1):
             write_csv(folder / "histories" / f"noise_{noise:g}_run_{run:03d}.csv", history)
-
-        for kind, matrix in zip(("A", "H"), matrices[noise]):
-
-            path = folder / f"{kind}_noise_{noise:g}.csv"
-
-            with path.open("w", newline="", encoding="utf-8") as file:
-
-                writer = csv.writer(file)
-                writer.writerow(["row_strategy / column_opponent", *LABELS])
-
-                for label, values in zip(LABELS, matrix):
-                    writer.writerow([label, *values])
+        A, H = matrices[noise]
+        write_matrix(folder / f"A_noise_{noise:g}.csv", A)
+        write_matrix(folder / f"H_noise_{noise:g}.csv", H)
 
     save_figures(histories, summaries, matrices, folder / "figures")
 
 
+def plot_outcomes(histories):
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4), layout="constrained")
+    number_of_runs = len(histories[0.0])
+
+    for noise in NOISE_LEVELS:
+        for ax, measure in zip(axes, ["cooperation", "payoff"]):
+            values = []
+            for history in histories[noise]:
+                values.append([row[measure] for row in history])
+            values = np.array(values)
+            if measure == "cooperation":
+                values = values * 100
+
+            generations = np.arange(values.shape[1])
+            ax.plot(generations, np.median(values, axis=0), color=COLORS[noise], label=f"noise {noise:g}")
+            if number_of_runs > 1:
+                ax.fill_between(generations, values.min(axis=0), values.max(axis=0),
+                                color=COLORS[noise], alpha=0.15)
+            ax.set_xlabel("Generation")
+
+    axes[0].set(ylabel="Cooperative actions (%)", ylim=(0, 100))
+    axes[1].set(ylabel="Payoff per round", ylim=(0, 5))
+    axes[0].legend()
+
+    population_size = SETTINGS["population"]
+    if number_of_runs == 1:
+        fig.suptitle(f"Live experiment | 1 run per noise level | {population_size} individuals per run")
+    else:
+        fig.suptitle(f"{number_of_runs} runs per noise level | {population_size} individuals per run"
+                     " | median and full range")
+    return fig
+
+
+def plot_strategy_frequencies(histories):
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4), sharey=True, layout="constrained")
+    tracked = [0, 5, 6, 7, 31]
+    others = [i for i in range(32) if i not in tracked]
+
+    for ax, noise in zip(axes, NOISE_LEVELS):
+        counts = []
+        for history in histories[noise]:
+            run_counts = []
+            for row in history:
+                run_counts.append([row[f"count_{bits}"] for bits in BITS])
+            counts.append(run_counts)
+        percentages = np.mean(counts, axis=0) * 100 / SETTINGS["population"]
+        generations = np.arange(len(percentages))
+
+        for i in tracked:
+            ax.plot(generations, percentages[:, i], label=LABELS[i])
+        ax.plot(generations, percentages[:, others].sum(axis=1), color="gray", ls="--", label="Other strategies")
+        ax.set(title=f"Noise {noise:g}", xlabel="Generation", ylim=(0, 100))
+
+    axes[0].set_ylabel("Population (%)")
+    axes[-1].legend(fontsize=7, loc="upper left", bbox_to_anchor=(1.02, 1))
+    return fig
+
+
+def plot_matrix(matrix, noise, kind):
+    if kind == "A":
+        title, maximum = "Expected payoff A", 5
+    else:
+        title, maximum = "Cooperation H", 1
+
+    fig, ax = plt.subplots(figsize=(13, 12), layout="constrained")
+    image = ax.imshow(matrix, vmin=0, vmax=maximum, cmap="viridis")
+    ax.set_xticks(range(32), LABELS, rotation=90, fontsize=7)
+    ax.set_yticks(range(32), LABELS, fontsize=7)
+    ax.set(title=f"{title} | noise {noise:g}", xlabel="Column opponent", ylabel="Row strategy")
+    fig.colorbar(image, ax=ax, shrink=0.75)
+    return fig
+
+
+def plot_classical_payoffs(matrices):
+    selected = [0, 31, 5, 6, 7]
+    names = [NAMES[i] for i in selected]
+    fig, axes = plt.subplots(1, 3, figsize=(14, 5), layout="constrained")
+
+    for ax, noise in zip(axes, NOISE_LEVELS):
+        A = matrices[noise][0]
+        values = np.zeros((5, 5))
+        for row in range(5):
+            for column in range(5):
+                values[row, column] = A[selected[row], selected[column]]
+
+        ax.imshow(values, vmin=0, vmax=5, cmap="Blues")
+        ax.set_xticks(range(5), names, rotation=45, ha="right")
+        ax.set_yticks(range(5), names)
+        ax.set(title=f"Payoff A | noise {noise:g}", xlabel="Column opponent")
+
+        for row in range(5):
+            for column in range(5):
+                value = values[row, column]
+                color = "white" if value > 2.5 else "black"
+                ax.text(column, row, f"{value:.2f}", ha="center", va="center", color=color)
+
+    return fig
+
+
+def plot_final_window(summaries):
+    """One dot per run, black bar = median."""
+    fig, axes = plt.subplots(1, 2, figsize=(9, 4), layout="constrained")
+
+    for ax, measure in zip(axes, MEASURES):
+        for position, noise in enumerate(NOISE_LEVELS):
+            values = np.array(get_values(summaries, noise, measure))
+            if measure == "window_cooperation":
+                values = values * 100
+
+            x_positions = position + np.linspace(-0.12, 0.12, len(values))
+            ax.scatter(x_positions, values, color=COLORS[noise], alpha=0.65, s=20)
+            ax.plot([position - 0.2, position + 0.2], [np.median(values)] * 2, color="black")
+
+        ax.set_xticks(range(3), [str(noise) for noise in NOISE_LEVELS])
+        ax.set_xlabel("Action noise")
+
+    axes[0].set(ylabel="Cooperative actions (%)", ylim=(0, 100))
+    axes[1].set_ylabel("Payoff per round")
+    fig.suptitle(f"Final {SETTINGS['final_window']} generations"
+                 f" | each dot is one run of {SETTINGS['population']} individuals")
+    return fig
+
+
 def save_figures(histories, summaries, matrices, folder):
-    """Save the same plots that the notebook can display directly."""
-
-    folder = Path(folder)
-    folder.mkdir(parents=True, exist_ok=True)
-    population_size = int(summaries[0]["population"])
-
     figures = {
-        "outcomes.png": plot_outcomes(histories, population_size),
-        "strategy_frequencies.png": plot_strategy_frequencies(histories, population_size),
+        "outcomes.png": plot_outcomes(histories),
+        "strategy_frequencies.png": plot_strategy_frequencies(histories),
         "classical_payoffs.png": plot_classical_payoffs(matrices),
         "final_window.png": plot_final_window(summaries),
     }
-
-    for name, figure in figures.items():
-
-        figure.savefig(folder / name, dpi=180)
-        plt.close(figure)
+    for name, fig in figures.items():
+        fig.savefig(folder / name, dpi=180)
+        plt.close(fig)
 
     for noise in NOISE_LEVELS:
-
-        for kind, matrix in zip(("A", "H"), matrices[noise]):
-
-            figure = plot_matrix(matrix, noise, kind)
-            figure.savefig(folder / f"matrix_{kind}_noise_{noise:g}.png", dpi=150)
-            plt.close(figure)
+        A, H = matrices[noise]
+        for kind, matrix in [("A", A), ("H", H)]:
+            fig = plot_matrix(matrix, noise, kind)
+            fig.savefig(folder / f"matrix_{kind}_noise_{noise:g}.png", dpi=150)
+            plt.close(fig)
 
 
 if __name__ == "__main__":
-
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--runs", type=int, default=30, help="Runs per noise level")
-    parser.add_argument("--seed", type=int, default=BASE_SEED, help="Base random seed")
-    arguments = parser.parse_args()
+    parser.add_argument("--runs", type=int, default=30, help="Runs per noise level (at least 2)")
+    args = parser.parse_args()
 
-    if arguments.runs < 2:
-        parser.error("Use at least two runs per condition for confidence intervals.")
+    plt.switch_backend("Agg")
 
-    plt.switch_backend("Agg")  # save figures without opening windows
-    settings = DEFAULT_SETTINGS.copy()
-
-    histories, summaries, matrices = run_study(arguments.runs, arguments.seed, settings)
-    comparisons = make_comparisons(summaries, arguments.seed + 900000)
+    histories, summaries, matrices = run_study(args.runs)
+    comparisons = make_comparisons(summaries)
     pilot = pilot_spread(summaries)
-    pilot_comparisons = make_comparisons(summaries, arguments.seed + 900000, max_runs=PILOT_RUNS)
+    pilot_comparisons = make_comparisons(summaries, max_runs=PILOT_RUNS)
 
     save_results(histories, summaries, matrices, comparisons, pilot, pilot_comparisons)
-
     print(f"Saved results to {RESULTS_FOLDER}")
